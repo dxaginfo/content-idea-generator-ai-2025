@@ -1,38 +1,87 @@
 const asyncHandler = require('express-async-handler');
 const Idea = require('../models/ideaModel');
-const openai = require('../services/openaiService');
+const openaiService = require('../services/openaiService');
 
-// @desc    Generate content ideas with OpenAI
+// @desc    Generate content ideas using AI
 // @route   POST /api/ideas/generate
 // @access  Private
 const generateIdeas = asyncHandler(async (req, res) => {
-  const { contentType, industry, audience, tone, count = 3 } = req.body;
+  const { 
+    topic, 
+    contentType = 'blog', 
+    industry, 
+    targetAudience, 
+    count = 3,
+    tone = 'professional',
+    keywords = []
+  } = req.body;
 
-  if (!contentType || !industry || !audience || !tone) {
+  if (!topic) {
     res.status(400);
-    throw new Error('Please provide all required fields');
+    throw new Error('Please provide a topic');
   }
 
-  try {
-    // Build the prompt for OpenAI
-    const prompt = buildGenerationPrompt(contentType, industry, audience, tone, count);
-    
-    // Call OpenAI service
-    const ideas = await openai.generateContentIdeas(prompt, count);
-    
-    if (!ideas || ideas.length === 0) {
-      res.status(500);
-      throw new Error('Failed to generate content ideas');
-    }
+  // Build AI prompt based on user input
+  let prompt = `Generate ${count} unique content ideas related to "${topic}"`;
+  
+  if (contentType) {
+    prompt += ` for ${contentType} content`;
+  }
+  
+  if (industry) {
+    prompt += ` in the ${industry} industry`;
+  }
+  
+  if (targetAudience) {
+    prompt += ` targeting ${targetAudience}`;
+  }
+  
+  if (keywords && keywords.length > 0) {
+    prompt += ` incorporating these keywords: ${keywords.join(', ')}`;
+  }
+  
+  if (tone) {
+    prompt += `. Use a ${tone} tone`;
+  }
+  
+  prompt += `. For each idea, provide a title, description, relevant keywords, target audience, and estimated engagement potential (high, medium, low). Format each idea as a JSON object.`;
 
+  try {
+    // Call OpenAI service to generate ideas
+    const generatedIdeas = await openaiService.generateContentIdeas(prompt, count);
+    
+    // Save generated ideas to the database for the user
+    const savedIdeas = [];
+    
+    for (const idea of generatedIdeas) {
+      // Add user preferences to content
+      const ideaWithMetadata = {
+        userId: req.user.id,
+        content: {
+          ...idea,
+          contentType,
+          tone,
+          industry: industry || '',
+          targetAudience: targetAudience || '',
+        },
+        isSaved: false,
+        isScheduled: false,
+        status: 'draft'
+      };
+      
+      const savedIdea = await Idea.create(ideaWithMetadata);
+      savedIdeas.push(savedIdea);
+    }
+    
     res.status(200).json({
       success: true,
-      data: ideas,
+      count: savedIdeas.length,
+      data: savedIdeas,
     });
   } catch (error) {
     console.error('Error generating ideas:', error);
     res.status(500);
-    throw new Error('Error generating content ideas. Please try again later.');
+    throw new Error(error.message || 'Error generating ideas');
   }
 });
 
@@ -40,11 +89,62 @@ const generateIdeas = asyncHandler(async (req, res) => {
 // @route   GET /api/ideas
 // @access  Private
 const getIdeas = asyncHandler(async (req, res) => {
-  const ideas = await Idea.find({ userId: req.user.id }).sort({ createdAt: -1 });
-  
+  // Parse query parameters for filtering
+  const { 
+    contentType, 
+    isSaved, 
+    isScheduled, 
+    status, 
+    keyword,
+    sort = '-createdAt',
+    limit = 10,
+    page = 1 
+  } = req.query;
+
+  // Build filter query
+  const query = { userId: req.user.id };
+
+  if (contentType) {
+    query['content.contentType'] = contentType;
+  }
+
+  if (isSaved !== undefined) {
+    query.isSaved = isSaved === 'true';
+  }
+
+  if (isScheduled !== undefined) {
+    query.isScheduled = isScheduled === 'true';
+  }
+
+  if (status) {
+    query.status = status;
+  }
+
+  if (keyword) {
+    query.$or = [
+      { 'content.title': { $regex: keyword, $options: 'i' } },
+      { 'content.description': { $regex: keyword, $options: 'i' } },
+      { 'content.keywords': { $regex: keyword, $options: 'i' } }
+    ];
+  }
+
+  // Pagination
+  const startIndex = (page - 1) * limit;
+  const total = await Idea.countDocuments(query);
+
+  const ideas = await Idea.find(query)
+    .sort(sort)
+    .skip(startIndex)
+    .limit(parseInt(limit, 10));
+
   res.status(200).json({
     success: true,
     count: ideas.length,
+    pagination: {
+      total,
+      page: parseInt(page, 10),
+      pages: Math.ceil(total / limit),
+    },
     data: ideas,
   });
 });
@@ -54,18 +154,18 @@ const getIdeas = asyncHandler(async (req, res) => {
 // @access  Private
 const getIdea = asyncHandler(async (req, res) => {
   const idea = await Idea.findById(req.params.id);
-  
+
   if (!idea) {
     res.status(404);
     throw new Error('Idea not found');
   }
-  
-  // Check if the idea belongs to the user
-  if (idea.userId.toString() !== req.user.id) {
-    res.status(401);
+
+  // Check if the idea belongs to the logged-in user
+  if (idea.userId.toString() !== req.user.id.toString()) {
+    res.status(403);
     throw new Error('Not authorized to access this idea');
   }
-  
+
   res.status(200).json({
     success: true,
     data: idea,
@@ -76,21 +176,23 @@ const getIdea = asyncHandler(async (req, res) => {
 // @route   POST /api/ideas
 // @access  Private
 const createIdea = asyncHandler(async (req, res) => {
-  const { content, isSaved = true, isScheduled = false, scheduledDate = null } = req.body;
-  
+  const { content, isSaved, isScheduled, scheduledDate, notes, status } = req.body;
+
   if (!content || !content.title || !content.description) {
     res.status(400);
-    throw new Error('Please provide idea content with title and description');
+    throw new Error('Please provide title and description');
   }
-  
+
   const idea = await Idea.create({
-    content,
     userId: req.user.id,
-    isSaved,
-    isScheduled,
-    scheduledDate,
+    content,
+    isSaved: isSaved || false,
+    isScheduled: isScheduled || false,
+    scheduledDate: scheduledDate || null,
+    notes: notes || '',
+    status: status || 'draft',
   });
-  
+
   res.status(201).json({
     success: true,
     data: idea,
@@ -102,23 +204,24 @@ const createIdea = asyncHandler(async (req, res) => {
 // @access  Private
 const updateIdea = asyncHandler(async (req, res) => {
   let idea = await Idea.findById(req.params.id);
-  
+
   if (!idea) {
     res.status(404);
     throw new Error('Idea not found');
   }
-  
-  // Check if the idea belongs to the user
-  if (idea.userId.toString() !== req.user.id) {
-    res.status(401);
+
+  // Check if the idea belongs to the logged-in user
+  if (idea.userId.toString() !== req.user.id.toString()) {
+    res.status(403);
     throw new Error('Not authorized to update this idea');
   }
-  
+
+  // Update idea
   idea = await Idea.findByIdAndUpdate(req.params.id, req.body, {
     new: true,
     runValidators: true,
   });
-  
+
   res.status(200).json({
     success: true,
     data: idea,
@@ -130,39 +233,25 @@ const updateIdea = asyncHandler(async (req, res) => {
 // @access  Private
 const deleteIdea = asyncHandler(async (req, res) => {
   const idea = await Idea.findById(req.params.id);
-  
+
   if (!idea) {
     res.status(404);
     throw new Error('Idea not found');
   }
-  
-  // Check if the idea belongs to the user
-  if (idea.userId.toString() !== req.user.id) {
-    res.status(401);
+
+  // Check if the idea belongs to the logged-in user
+  if (idea.userId.toString() !== req.user.id.toString()) {
+    res.status(403);
     throw new Error('Not authorized to delete this idea');
   }
-  
-  await idea.remove();
-  
+
+  await idea.deleteOne();
+
   res.status(200).json({
     success: true,
     data: {},
   });
 });
-
-// Helper function to build the OpenAI prompt
-const buildGenerationPrompt = (contentType, industry, audience, tone, count) => {
-  return `Generate ${count} creative ${contentType} content ideas for a ${industry} business targeting ${audience} with a ${tone} tone.
-
-For each idea, provide:
-1. An engaging title
-2. A brief description (2-3 sentences)
-3. 3-5 relevant keywords
-4. Target audience specifics
-5. Estimated engagement potential (high, medium, or low)
-
-Format each idea as a JSON object with the following properties: title, description, keywords (array), targetAudience, estimatedEngagement.`;
-};
 
 module.exports = {
   generateIdeas,
