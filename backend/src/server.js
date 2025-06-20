@@ -9,6 +9,7 @@ const { errorHandler, notFound } = require('./middleware/errorMiddleware');
 // Route imports
 const authRoutes = require('./routes/authRoutes');
 const ideaRoutes = require('./routes/ideaRoutes');
+const calendarRoutes = require('./routes/calendarRoutes');
 
 // Connect to database
 connectDB();
@@ -30,6 +31,7 @@ if (config.server.nodeEnv === 'development') {
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/ideas', ideaRoutes);
+app.use('/api/calendar', calendarRoutes);
 
 // Health check route
 app.get('/health', (req, res) => {
